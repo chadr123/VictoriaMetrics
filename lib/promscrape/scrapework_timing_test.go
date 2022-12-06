@@ -84,8 +84,9 @@ vm_tcplistener_write_calls_total{name="https", addr=":443"} 132356
 		sw.ReadData = readDataFunc
 		sw.PushData = func(at *auth.Token, wr *prompbmarshal.WriteRequest) {}
 		timestamp := int64(0)
+		stopCh := make(chan struct{})
 		for pb.Next() {
-			if err := sw.scrapeInternal(timestamp, timestamp); err != nil {
+			if err := sw.scrapeInternal(stopCh, timestamp, timestamp); err != nil {
 				panic(fmt.Errorf("unexpected error: %w", err))
 			}
 			timestamp++

@@ -1,6 +1,7 @@
 package promscrape
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/auth"
@@ -38,6 +39,11 @@ var (
 		"This may be used for reducing the number of log lines related to scrape errors. See also -promscrape.suppressScrapeErrors")
 	seriesLimitPerTarget          = flag.Int("promscrape.seriesLimitPerTarget", 0, "Optional limit on the number of unique time series a single scrape target can expose. See https://docs.victoriametrics.com/vmagent.html#cardinality-limiter for more info")
 	minResponseSizeForStreamParse = flagutil.NewBytes("promscrape.minResponseSizeForStreamParse", 1e6, "The minimum target response size for automatic switching to stream parsing mode, which can reduce memory usage. See https://docs.victoriametrics.com/vmagent.html#stream-parsing-mode")
+)
+
+var (
+	// ErrCanceled is returned from canceled calls.
+	ErrCanceled = errors.New("canceled")
 )
 
 // ScrapeWork represents a unit of work for scraping Prometheus metrics.
@@ -308,7 +314,7 @@ func (sw *scrapeWork) run(stopCh <-chan struct{}, globalStopCh <-chan struct{}) 
 		timerpool.Put(timer)
 		ticker = time.NewTicker(scrapeInterval)
 		timestamp = time.Now().UnixNano() / 1e6
-		sw.scrapeAndLogError(timestamp, timestamp)
+		sw.scrapeAndLogError(stopCh, timestamp, timestamp)
 	}
 	defer ticker.Stop()
 	for {
@@ -339,7 +345,7 @@ func (sw *scrapeWork) run(stopCh <-chan struct{}, globalStopCh <-chan struct{}) 
 				// Too big jitter. Adjust timestamp
 				timestamp = t
 			}
-			sw.scrapeAndLogError(timestamp, t)
+			sw.scrapeAndLogError(stopCh, timestamp, t)
 		}
 	}
 }
@@ -352,8 +358,8 @@ func (sw *scrapeWork) logError(s string) {
 	}
 }
 
-func (sw *scrapeWork) scrapeAndLogError(scrapeTimestamp, realTimestamp int64) {
-	err := sw.scrapeInternal(scrapeTimestamp, realTimestamp)
+func (sw *scrapeWork) scrapeAndLogError(stopCh <-chan struct{}, scrapeTimestamp, realTimestamp int64) {
+	err := sw.scrapeInternal(stopCh, scrapeTimestamp, realTimestamp)
 	if err == nil {
 		return
 	}
@@ -403,19 +409,39 @@ func (sw *scrapeWork) getTargetResponse() ([]byte, error) {
 	return sw.ReadData(nil)
 }
 
-func (sw *scrapeWork) scrapeInternal(scrapeTimestamp, realTimestamp int64) error {
+func (sw *scrapeWork) waitForCompletion(stopCh <-chan struct{}, fn func() error) error {
+	ch := make(chan error)
+
+	// Run the given function asynchronously.
+	go func() {
+		ch <- fn()
+	}()
+	select {
+	case err := <-ch:
+		// Wait for completion.
+		return err
+	case <-stopCh:
+		// Need to stop immediately as the caller requested to stop it.
+		return ErrCanceled
+	}
+}
+
+func (sw *scrapeWork) scrapeInternal(stopCh <-chan struct{}, scrapeTimestamp, realTimestamp int64) error {
 	if *streamParse || sw.Config.StreamParse || sw.mustSwitchToStreamParseMode(sw.prevBodyLen) {
 		// Read data from scrape targets in streaming manner.
 		// This case is optimized for targets exposing more than ten thousand of metrics per target.
-		return sw.scrapeStream(scrapeTimestamp, realTimestamp)
+		return sw.scrapeStream(stopCh, scrapeTimestamp, realTimestamp)
 	}
 
 	// Common case: read all the data from scrape target to memory (body) and then process it.
 	// This case should work more optimally than stream parse code for common case when scrape target exposes
 	// up to a few thousand metrics.
 	body := leveledbytebufferpool.Get(sw.prevBodyLen)
-	var err error
-	body.B, err = sw.ReadData(body.B[:0])
+	err := sw.waitForCompletion(stopCh, func() error {
+		var err error
+		body.B, err = sw.ReadData(body.B[:0])
+		return err
+	})
 	endTimestamp := time.Now().UnixNano() / 1e6
 	duration := float64(endTimestamp-realTimestamp) / 1e3
 	scrapeDuration.Update(duration)
@@ -536,14 +562,18 @@ func (sbr *streamBodyReader) Read(b []byte) (int, error) {
 	return n, nil
 }
 
-func (sw *scrapeWork) scrapeStream(scrapeTimestamp, realTimestamp int64) error {
+func (sw *scrapeWork) scrapeStream(stopCh <-chan struct{}, scrapeTimestamp, realTimestamp int64) error {
 	samplesScraped := 0
 	samplesPostRelabeling := 0
 	wc := writeRequestCtxPool.Get(sw.prevLabelsLen)
 	// Do not pool sbr and do not pre-allocate sbr.body in order to reduce memory usage when scraping big responses.
 	var sbr streamBodyReader
-
-	sr, err := sw.GetStreamReader()
+	var sr *streamReader
+	err := sw.waitForCompletion(stopCh, func() error {
+		var err error
+		sr, err = sw.GetStreamReader()
+		return err
+	})
 	if err != nil {
 		err = fmt.Errorf("cannot read data: %s", err)
 	} else {
